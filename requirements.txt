@@ -1,0 +1,11 @@
+pandas
+numpy
+beautifulsoup4
+selenium
+sqlalchemy
+psycopg2-binary
+apache-airflow
+matplotlib
+seaborn
+plotly
+python-dotenv
