@@ -1,0 +1,211 @@
+version: '3.8'
+
+# ============================================================================
+# DOCKER COMPOSE - Système Complet Scraping Immobilier
+# Services: Airflow, PostgreSQL, Redis, (Kafka optionnel)
+# ============================================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.7.3-python3.10
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # Variables Python
+    PYTHONPATH: /opt/airflow/src
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./src:/opt/airflow/src
+    - ./data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # ==========================================================================
+  # POSTGRESQL - Base de données Airflow
+  # ==========================================================================
+  postgres:
+    image: postgres:14-alpine
+    container_name: immobilier_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    ports:
+      - "5432:5432"
+
+  # ==========================================================================
+  # AIRFLOW WEBSERVER - Interface web
+  # ==========================================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: immobilier_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ==========================================================================
+  # AIRFLOW SCHEDULER - Ordonnanceur de tâches
+  # ==========================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: immobilier_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ==========================================================================
+  # AIRFLOW INIT - Initialisation (première exécution)
+  # ==========================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: immobilier_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - ./airflow:/sources
+
+  # ==========================================================================
+  # AIRFLOW CLI - Commandes en ligne (optionnel)
+  # ==========================================================================
+  airflow-cli:
+    <<: *airflow-common
+    container_name: immobilier_airflow_cli
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+
+  # ==========================================================================
+  # POSTGRESQL DATA - Base de données applicative (optionnel)
+  # ==========================================================================
+  postgres-data:
+    image: postgres:14-alpine
+    container_name: immobilier_postgres_data
+    environment:
+      POSTGRES_USER: immobilier
+      POSTGRES_PASSWORD: immobilier123
+      POSTGRES_DB: immobilier_maroc
+    volumes:
+      - postgres-data-volume:/var/lib/postgresql/data
+      - ./sql/schema:/docker-entrypoint-initdb.d
+    ports:
+      - "5433:5432"
+    restart: always
+
+  # ==========================================================================
+  # KAFKA + ZOOKEEPER (Optionnel - Streaming)
+  # Décommenter si vous voulez utiliser Kafka
+  # ==========================================================================
+  # zookeeper:
+  #   image: confluentinc/cp-zookeeper:7.5.0
+  #   container_name: immobilier_zookeeper
+  #   environment:
+  #     ZOOKEEPER_CLIENT_PORT: 2181
+  #     ZOOKEEPER_TICK_TIME: 2000
+  #   ports:
+  #     - "2181:2181"
+  
+  # kafka:
+  #   image: confluentinc/cp-kafka:7.5.0
+  #   container_name: immobilier_kafka
+  #   depends_on:
+  #     - zookeeper
+  #   ports:
+  #     - "9092:9092"
+  #   environment:
+  #     KAFKA_BROKER_ID: 1
+  #     KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  #     KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+  #     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  # ==========================================================================
+  # PGADMIN - Interface graphique PostgreSQL (optionnel)
+  # ==========================================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: immobilier_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@immobilier.ma
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-volume:/var/lib/pgadmin
+    restart: always
+    profiles:
+      - debug
+
+# ============================================================================
+# VOLUMES PERSISTANTS
+# ============================================================================
+volumes:
+  postgres-db-volume:
+    name: immobilier_postgres_airflow
+  postgres-data-volume:
+    name: immobilier_postgres_data
+  pgadmin-volume:
+    name: immobilier_pgadmin
+
+# ============================================================================
+# RÉSEAUX
+# ============================================================================
+networks:
+  default:
+    name: immobilier_network

@@ -1,14 +1,32 @@
-# Analyse du Marche Immobilier au Maroc
 
-## 📌 Description
-Projet Fil Rouge Data Analyst visant a analyser les tendances du marche immobilier marocain via le scraping et l'automatisation.
+```
+Analyse-du-Marche-Immobilier
+├─ airflow
+│  ├─ dags
+│  │  ├─ airflow-dag-immobilier.py
+│  │  └─ scripts
+│  └─ plugins
+├─ avito_deep_data.json
+├─ data
+├─ docs
+│  └─ img
+├─ logs
+├─ notebooks
+├─ reports
+│  └─ viz
+├─ requirements.txt
+├─ setup_project.bat
+├─ sql
+│  ├─ queries
+│  └─ schema
+├─ src
+│  └─ scripts
+│     ├─ analysis
+│     ├─ cleaning
+│     └─ extraction
+│        ├─ Run-scrapers.py
+│        ├─ scraper-mubawab.py
+│        └─ scrapping-avito.py
+└─ tests
 
-## 🛠️ Installation
-1. Cloner le depot
-2. Installer les dependances : `pip install -r requirements.txt`
-
-## 📂 Structure
-- `src/`: Scripts Python (Extraction, Cleaning)
-- `airflow/`: Orchestration des pipelines
-- `sql/`: Scripts de creation de base de donnees (Medallion Architecture)
-- `notebooks/`: Analyses exploratoires (EDA)
+```
