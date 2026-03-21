@@ -18,6 +18,9 @@ from selenium.webdriver.support import expected_conditions as EC
 import undetected_chromedriver as uc
 import logging
 
+# Créer dossier logs
+os.makedirs('logs', exist_ok=True)
+
 # Configuration logging
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +63,7 @@ class MubawabScraper:
         options.add_argument("--window-size=1920,1080")
         
         try:
-            self.driver = uc.Chrome(options=options, use_subprocess=True)
+            self.driver = uc.Chrome(options=options, use_subprocess=True, version_main=145)
             logger.info("✅ Driver Chrome initialisé")
         except Exception as e:
             logger.error(f"❌ Erreur driver: {e}")
@@ -292,7 +295,7 @@ class MubawabScraper:
 
 def main():
     """Point d'entrée"""
-    scraper = MubawabScraper(max_pages=5)
+    scraper = MubawabScraper(max_pages=2)  # Test batch: 2 pages
     df = scraper.scrape()
     
     # Stats rapides

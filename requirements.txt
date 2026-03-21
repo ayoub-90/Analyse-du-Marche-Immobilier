@@ -14,4 +14,6 @@ ipykernel
 webdriver-manager
 undetected-chromedriver 
 setuptools
+scikit-learn
+statsmodels
 

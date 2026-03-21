@@ -54,8 +54,12 @@ class DataCombiner:
             df_avito = pd.DataFrame()
         else:
             latest_avito = max(avito_files, key=os.path.getctime)
-            df_avito = pd.read_csv(latest_avito)
-            logger.info(f"✓ Avito: {len(df_avito)} annonces ({latest_avito})")
+            if os.path.getsize(latest_avito) == 0:
+                logger.warning(f"⚠️ Fichier Avito vide (0 octets): {latest_avito}")
+                df_avito = pd.DataFrame()
+            else:
+                df_avito = pd.read_csv(latest_avito)
+                logger.info(f"✓ Avito: {len(df_avito)} annonces ({latest_avito})")
         
         # Mubawab
         mubawab_files = glob.glob("data/raw/mubawab/mubawab_*.csv")
@@ -64,8 +68,12 @@ class DataCombiner:
             df_mubawab = pd.DataFrame()
         else:
             latest_mubawab = max(mubawab_files, key=os.path.getctime)
-            df_mubawab = pd.read_csv(latest_mubawab)
-            logger.info(f"✓ Mubawab: {len(df_mubawab)} annonces ({latest_mubawab})")
+            if os.path.getsize(latest_mubawab) == 0:
+                logger.warning(f"⚠️ Fichier Mubawab vide (0 octets): {latest_mubawab}")
+                df_mubawab = pd.DataFrame()
+            else:
+                df_mubawab = pd.read_csv(latest_mubawab)
+                logger.info(f"✓ Mubawab: {len(df_mubawab)} annonces ({latest_mubawab})")
         
         return df_avito, df_mubawab
     

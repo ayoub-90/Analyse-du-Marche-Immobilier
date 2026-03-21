@@ -56,12 +56,12 @@ logs-mubawab: ## Afficher les logs du scraper Mubawab
 
 scrape-avito: ## Lancer scraper Avito (local)
 	@echo "$(BLUE)Scraping Avito...$(NC)"
-	python src/scrapers/avito_scraper.py
+	python src/scrappers/avito_scraper.py
 	@echo "$(GREEN)✓ Scraping Avito terminé$(NC)"
 
 scrape-mubawab: ## Lancer scraper Mubawab (local)
 	@echo "$(BLUE)Scraping Mubawab...$(NC)"
-	python src/scrapers/mubawab_scraper.py
+	python src/scrappers/mubawab_scraper.py
 	@echo "$(GREEN)✓ Scraping Mubawab terminé$(NC)"
 
 combine: ## Combiner les données

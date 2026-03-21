@@ -37,12 +37,12 @@ log = logging.getLogger(__name__)
 
 SCRAPERS = {
     "avito": {
-        "script": "src/scripts/extraction/scrapping-avito.py",
+        "script": "src/scrappers/avito_scraper.py",
         "name": "Avito",
         "color": "\033[94m",  # Bleu
     },
     "mubawab": {
-        "script": "src/scripts/extraction/scraper-mubawab.py",
+        "script": "src/scrappers/mubawab_scraper.py",
         "name": "Mubawab",
         "color": "\033[91m",  # Rouge
     }

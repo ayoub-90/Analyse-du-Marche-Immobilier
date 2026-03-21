@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 default_args = {
     'owner': 'data-team',
     'depends_on_past': False,
-    'email': ['votre@email.com'],
+    'email': ['elharemayoub1@gmail.com'],
     'email_on_failure': True,
     'email_on_retry': False,
     'retries': 2,
