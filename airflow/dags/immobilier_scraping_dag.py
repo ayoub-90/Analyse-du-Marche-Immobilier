@@ -219,6 +219,49 @@ def send_notification_task(**context):
     
     return message
 
+def load_to_postgres_task(**context):
+    import pandas as pd
+    import psycopg2
+    from psycopg2.extras import execute_values
+
+    ti = context['task_instance']
+    combined_file = ti.xcom_pull(key='combined_file', task_ids='combine_data')
+
+    df = pd.read_csv(combined_file)
+
+    conn = psycopg2.connect(
+        host="postgres-data",
+        port=5432,
+        dbname="immobilier_maroc",
+        user="immobilier",
+        password="immobilier123"
+    )
+
+    columns = [
+        'id_annonce','source','url','titre','prix','ville','type_bien',
+        'surface_m2','nb_chambres','nb_salles_bain','etage',
+        'parking','ascenseur','balcon','piscine','jardin',
+        'description','date_scraping'
+    ]
+
+    # Only keep columns that exist in the dataframe
+    cols = [c for c in columns if c in df.columns]
+    records = df[cols].where(pd.notnull(df[cols]), None).values.tolist()
+
+    with conn.cursor() as cur:
+        execute_values(cur, f"""
+            INSERT INTO annonces ({','.join(cols)})
+            VALUES %s
+            ON CONFLICT (url) DO UPDATE SET
+                prix       = EXCLUDED.prix,
+                updated_at = NOW()
+        """, records)
+    
+    conn.commit()
+    conn.close()
+
+    print(f"✅ {len(records)} annonces insérées/mises à jour en base")
+
 
 # =============================================================================
 # DÉFINITION DES TÂCHES AIRFLOW
