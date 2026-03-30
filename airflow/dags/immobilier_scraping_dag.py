@@ -12,7 +12,9 @@ import sys
 import os
 
 # Ajouter le chemin src au PYTHONPATH
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+# Also ensure absolute fallback for Docker
+sys.path.insert(0, '/opt/airflow/src')
 
 # =============================================================================
 # CONFIGURATION
@@ -22,7 +24,7 @@ default_args = {
     'owner': 'data-team',
     'depends_on_past': False,
     'email': ['elharemayoub1@gmail.com'],
-    'email_on_failure': True,
+    'email_on_failure': False,  # Désactivé car SMTP n'est pas configuré
     'email_on_retry': False,
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
@@ -31,11 +33,13 @@ default_args = {
 dag = DAG(
     'immobilier_maroc_pipeline',
     default_args=default_args,
-    description='Pipeline complet scraping immobilier Maroc',
-    schedule_interval='0 2 * * *',  # Tous les jours à 2h du matin
+    description='Pipeline continu scraping immobilier Maroc (Micro-batch)',
+    schedule_interval='*/15 * * * *',  # Toutes les 15 minutes
     start_date=days_ago(1),
     catchup=False,
-    tags=['scraping', 'immobilier', 'production'],
+    max_active_runs=1,
+    concurrency=2,  
+    tags=['scraping', 'immobilier', 'production', 'micro-batch'],
 )
 
 
@@ -45,11 +49,11 @@ dag = DAG(
 
 def scrape_avito_task(**context):
     """Tâche 1: Scraper Avito"""
-    from scrapers.avito_scraper import AvitoScraper
+    from scrappers.avito_scraper import AvitoScraper
     
     print("🔵 Démarrage scraping Avito...")
     
-    scraper = AvitoScraper(max_pages=20)  # Production: 20 pages
+    scraper = AvitoScraper(target_count=20)  # Production: 20 article
     df = scraper.scrape()
     
     # Passer le chemin du fichier à la prochaine tâche
@@ -66,11 +70,11 @@ def scrape_avito_task(**context):
 
 def scrape_mubawab_task(**context):
     """Tâche 2: Scraper Mubawab"""
-    from scrapers.mubawab_scraper import MubawabScraper
+    from scrappers.mubawab_scraper import MubawabScraper
     
     print("🔴 Démarrage scraping Mubawab...")
     
-    scraper = MubawabScraper(max_pages=20)
+    scraper = MubawabScraper(target_count=20)
     df = scraper.scrape()
     
     import glob
@@ -220,47 +224,30 @@ def send_notification_task(**context):
     return message
 
 def load_to_postgres_task(**context):
-    import pandas as pd
-    import psycopg2
-    from psycopg2.extras import execute_values
-
+    """Tâche 7: Charger les données dans PostgreSQL (Schéma en Étoile)"""
+    from processing.load_to_sql import load_csv_to_sql
+    
+    print("🐘 Démarrage de l'insertion dans PostgreSQL (Star Schema)...")
     ti = context['task_instance']
     combined_file = ti.xcom_pull(key='combined_file', task_ids='combine_data')
+    try:
+        load_csv_to_sql(filepath=combined_file)
+        print("✅ Insertion réussie !")
+    except Exception as e:
+        print(f"❌ Erreur lors de l'insertion PostgreSQL : {e}")
+        raise
 
-    df = pd.read_csv(combined_file)
 
-    conn = psycopg2.connect(
-        host="postgres-data",
-        port=5432,
-        dbname="immobilier_maroc",
-        user="immobilier",
-        password="immobilier123"
-    )
-
-    columns = [
-        'id_annonce','source','url','titre','prix','ville','type_bien',
-        'surface_m2','nb_chambres','nb_salles_bain','etage',
-        'parking','ascenseur','balcon','piscine','jardin',
-        'description','date_scraping'
-    ]
-
-    # Only keep columns that exist in the dataframe
-    cols = [c for c in columns if c in df.columns]
-    records = df[cols].where(pd.notnull(df[cols]), None).values.tolist()
-
-    with conn.cursor() as cur:
-        execute_values(cur, f"""
-            INSERT INTO annonces ({','.join(cols)})
-            VALUES %s
-            ON CONFLICT (url) DO UPDATE SET
-                prix       = EXCLUDED.prix,
-                updated_at = NOW()
-        """, records)
+def ml_pipeline_task(**context):
+    """Tâche Optionnelle: Lancer le pipeline ML"""
+    from cleaning.ml_pipeline import MLPipeline
     
-    conn.commit()
-    conn.close()
-
-    print(f"✅ {len(records)} annonces insérées/mises à jour en base")
+    print("🤖 Démarrage du pipeline ML...")
+    pipeline = MLPipeline()
+    report = pipeline.run()
+    total_rows = report.get('steps', {}).get('step7_split', {}).get('total_rows', 'N/A') if report else 'N/A'
+    print(f"✅ Pipeline ML terminé: {total_rows} lignes traitées")
+    return report
 
 
 # =============================================================================
@@ -303,6 +290,18 @@ task_notify = PythonOperator(
     dag=dag,
 )
 
+task_load_sql = PythonOperator(
+    task_id='load_to_postgres',
+    python_callable=load_to_postgres_task,
+    dag=dag,
+)
+
+task_ml_pipeline = PythonOperator(
+    task_id='ml_pipeline',
+    python_callable=ml_pipeline_task,
+    dag=dag,
+)
+
 # Tâche de nettoyage (optionnelle)
 task_cleanup = BashOperator(
     task_id='cleanup_old_files',
@@ -320,11 +319,10 @@ task_cleanup = BashOperator(
 # DÉPENDANCES (FLOW DU PIPELINE)
 # =============================================================================
 
-# Phase 1: Scraping en parallèle
+# Exécution strictement séquentielle (Micro-batch)
 [task_scrape_avito, task_scrape_mubawab] >> task_validate
-
-# Phase 2: Traitement séquentiel
-task_validate >> task_combine >> task_stats >> task_notify >> task_cleanup
+task_validate >> task_combine >> task_ml_pipeline >> task_load_sql
+task_load_sql >> task_stats >> task_notify >> task_cleanup
 
 
 # =============================================================================

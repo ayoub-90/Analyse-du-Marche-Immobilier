@@ -30,6 +30,9 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import psycopg2
 
 warnings.filterwarnings('ignore')
 
@@ -411,6 +414,80 @@ class MLPipeline:
         logger.info(f"  Colonnes X     : {list(X.columns)}")
         logger.info("═" * 55)
 
+    # ─── ÉTAPE 8 : Entraînement & Logs KPI Power BI ───────────
+    def step8_train_and_evaluate(self) -> None:
+        logger.info("═" * 55)
+        logger.info("ÉTAPE 8 │ Entraînement Modèle & KPI Power BI")
+        logger.info("═" * 55)
+
+        X_train_path = os.path.join(self.output_dir, 'X_train.csv')
+        y_train_path = os.path.join(self.output_dir, 'y_train.csv')
+        X_test_path  = os.path.join(self.output_dir, 'X_test.csv')
+        y_test_path  = os.path.join(self.output_dir, 'y_test.csv')
+
+        if not all(os.path.exists(p) for p in [X_train_path, y_train_path, X_test_path, y_test_path]):
+            logger.warning("Fichiers train/test introuvables. Étape 8 ignorée.")
+            return
+
+        X_train = pd.read_csv(X_train_path)
+        y_train = pd.read_csv(y_train_path)['prix']
+        X_test  = pd.read_csv(X_test_path)
+        y_test  = pd.read_csv(y_test_path)['prix']
+
+        logger.info("  🤖 Entraînement du modèle (RandomForestRegressor)...")
+        # On utilise un modèle rapide mais robuste pour le pipeline continu
+        model = RandomForestRegressor(n_estimators=50, random_state=RANDOM_STATE, n_jobs=-1)
+        model.fit(X_train, y_train)
+
+        # Predictions
+        y_pred = model.predict(X_test)
+
+        # Calcul des métriques KPI
+        r2 = r2_score(y_test, y_pred)
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+        logger.info(f"  📊 Performance R² Score : {r2 * 100:.2f} %")
+        logger.info(f"  📊 Performance MAE      : {mae:,.0f} MAD")
+        logger.info(f"  📊 Performance RMSE     : {rmse:,.0f} MAD")
+
+        # Sauvegarder le modèle
+        model_dir = os.path.join(_PROJECT_ROOT, 'data', 'models')
+        os.makedirs(model_dir, exist_ok=True)
+        model_path = os.path.join(model_dir, 'rf_model.pkl')
+        with open(model_path, 'wb') as f:
+            pickle.dump(model, f)
+        logger.info(f"  💾 Modèle sauvegardé dans {model_path}")
+
+        # Enregistrement dans PostgreSQL pour Power BI
+        logger.info("  🐘 Insertion des KPIs dans PostgreSQL (model_metrics)...")
+        try:
+            conn = psycopg2.connect(
+                host=os.getenv("PG_HOST", "localhost"),
+                port=int(os.getenv("PG_PORT", "5433")),
+                dbname=os.getenv("PG_DB", "immobilier_maroc"),
+                user=os.getenv("PG_USER", "immobilier"),
+                password=os.getenv("PG_PASSWORD", "immobilier123")
+            )
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO model_metrics (modele, r2_score, rmse, mae, lignes_entrainement)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, ("RandomForestRegressor", float(r2), float(rmse), float(mae), len(X_train)))
+            conn.commit()
+            conn.close()
+            logger.info("  ✅ KPIs de performance du modèle enregistrés avec succès !")
+        except Exception as e:
+            logger.error(f"  ❌ Erreur lors de l'insertion dans PostgreSQL: {e}")
+
+        self.report['steps']['step8_model'] = {
+            'r2_score': round(r2, 4),
+            'mae': round(mae, 2),
+            'rmse': round(rmse, 2),
+            'model_used': 'RandomForestRegressor'
+        }
+        logger.info("═" * 55)
+
     # ─── RUN ──────────────────────────────────────────────────
     def run(self) -> None:
         """Exécute le pipeline séquentiel complet."""
@@ -428,6 +505,7 @@ class MLPipeline:
             self.step5_encode()
             self.step6_scale()
             self.step7_split_and_save()
+            self.step8_train_and_evaluate()
         except Exception as e:
             logger.error(f"❌ PIPELINE ÉCHOUÉ à l'étape : {e}")
             self.report['status'] = 'FAILED'
@@ -436,6 +514,7 @@ class MLPipeline:
 
         elapsed = (datetime.now() - start).seconds
         logger.info(f"\n  ⏱️  Temps total : {elapsed}s")
+        return self.report
 
 
 # ═══════════════════════════════════════════════════════

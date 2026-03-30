@@ -44,13 +44,14 @@ logger = logging.getLogger(__name__)
 
 
 class AvitoScraper:
-    """Scraper Avito simplifié et robuste"""
+    """Scraper Avito simplifié et robuste avec gestion d'état (Incremental)"""
 
-    def __init__(self, max_pages: int = 10):
-        self.max_pages = max_pages
+    def __init__(self, target_count: int = 20):
+        self.target_count = target_count
         self.base_url = "https://www.avito.ma/fr/marrakech/appartements-a_vendre"
         self.data: List[Dict] = []
         self.driver = None
+        self.state_file = "data/state/avito_state.json"
 
         self.type_mapping = {
             "appartement": "Appartement",
@@ -65,18 +66,64 @@ class AvitoScraper:
 
     # ── Driver ───────────────────────────────────────────────────────────────
 
+    # def setup_driver(self):
+    #     is_docker = os.path.exists('/.dockerenv') or os.environ.get('AIRFLOW_HOME')
+        
+    #     options = uc.ChromeOptions() if not is_docker else uc.webdriver.ChromeOptions()
+    #     options.add_argument("--headless")  # Nécessaire dans Docker (pas d'écran)
+    #     options.add_argument("--no-sandbox")
+    #     options.add_argument("--disable-dev-shm-usage")
+    #     options.add_argument("--disable-gpu")
+    #     options.add_argument("--window-size=1920,1080")
+        
+    #     if not is_docker:
+    #         options.add_argument("--disable-blink-features=AutomationControlled")
+
+    #     try:
+    #         if is_docker:
+    #             # Utiliser le binaire chromium et le driver installés via apt dans le Dockerfile
+    #             from selenium import webdriver
+    #             from selenium.webdriver.chrome.service import Service
+                
+    #             options.binary_location = "/usr/bin/chromium"
+    #             service = Service("/usr/bin/chromedriver")
+    #             self.driver = webdriver.Chrome(service=service, options=options)
+    #             logger.info("✅ Driver Chromium (Docker) initialisé")
+    #         else:
+    #             self.driver = uc.Chrome(options=options, use_subprocess=True)
+    #             logger.info("✅ Driver Chrome (Local) initialisé")
+    #     except Exception as e:
+    #         logger.error(f"❌ Erreur driver: {e}")
+    #         raise
     def setup_driver(self):
-        options = uc.ChromeOptions()
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1920,1080")
-        try:
-            self.driver = uc.Chrome(options=options, use_subprocess=True, version_main=145)
-            logger.info("✅ Driver Chrome initialisé")
-        except Exception as e:
-            logger.error(f"❌ Erreur driver: {e}")
-            raise
+        is_docker = os.path.exists('/.dockerenv') or os.environ.get('AIRFLOW_HOME')
+
+        if is_docker:
+            from selenium import webdriver as selenium_webdriver
+            from selenium.webdriver.chrome.service import Service
+
+            options = selenium_webdriver.ChromeOptions()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            options.binary_location = "/usr/bin/chromium"
+
+            service = Service("/usr/bin/chromedriver")
+            self.driver = selenium_webdriver.Chrome(service=service, options=options)
+            logger.info("✅ Driver Chromium (Docker) initialisé")
+        else:
+            options = uc.ChromeOptions()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+
+            self.driver = uc.Chrome(options=options, use_subprocess=True)
+            logger.info("✅ Driver Chrome (Local) initialisé")
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -363,36 +410,59 @@ class AvitoScraper:
 
     # ── Scraping complet ─────────────────────────────────────────────────────
 
+    def get_state(self) -> int:
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    return json.load(f).get('last_page', 1)
+            except Exception:
+                pass
+        return 1
+
+    def save_state(self, page: int):
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+        with open(self.state_file, 'w') as f:
+            json.dump({'last_page': page}, f)
+
     def scrape(self) -> pd.DataFrame:
-        logger.info("🚀 Démarrage scraping Avito")
-        logger.info(f"Pages max: {self.max_pages}")
+        logger.info("🚀 Démarrage scraping Avito (Micro-batching)")
+        logger.info(f"Cible: {self.target_count} annonces")
 
         self.setup_driver()
 
         try:
-            # Phase 1 : collecter URLs
-            all_urls = []
-            for page in range(1, self.max_pages + 1):
-                urls = self.scrape_listing_page(page)
-                all_urls.extend(urls)
-                time.sleep(random.uniform(2, 4))
+            current_page = self.get_state()
+            logger.info(f"🔄 Reprise depuis la page {current_page}")
 
-            logger.info(f"📊 Total URLs: {len(all_urls)}")
-
-            # Phase 2 : scraper les détails
-            for idx, url in enumerate(all_urls, 1):
-                logger.info(f"[{idx}/{len(all_urls)}] Extraction...")
-                detail = self.scrape_detail_page(url)
-                if detail:
-                    self.data.append(detail)
-                time.sleep(random.uniform(3, 5))
+            while len(self.data) < self.target_count:
+                logger.info(f"📄 Scraping Page {current_page}...")
+                urls = self.scrape_listing_page(current_page)
+                
+                if not urls:
+                    logger.warning("Fin des pages atteintes ou blocage.")
+                    break
+                    
+                for idx, url in enumerate(urls, 1):
+                    if len(self.data) >= self.target_count:
+                        break
+                    logger.info(f"[{len(self.data)+1}/{self.target_count}] Extraction: {url}")
+                    detail = self.scrape_detail_page(url)
+                    if detail:
+                        self.data.append(detail)
+                    time.sleep(random.uniform(2, 4))
+                
+                # Passer à la page suivante et sauvegarder l'état
+                current_page += 1
+                self.save_state(current_page)
+                time.sleep(random.uniform(1, 3))
 
             # Sauvegarde
             df = pd.DataFrame(self.data)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = f"data/raw/avito/avito_{timestamp}.csv"
             os.makedirs("data/raw/avito", exist_ok=True)
-            df.to_csv(filepath, index=False, encoding='utf-8-sig')
+            if not df.empty:
+                df.to_csv(filepath, index=False, encoding='utf-8-sig')
 
             logger.info(f"💾 Sauvegardé: {filepath}")
             logger.info(f"📊 {len(df)} annonces extraites")
@@ -407,7 +477,7 @@ class AvitoScraper:
 # ── Point d'entrée ───────────────────────────────────────────────────────────
 
 def main():
-    scraper = AvitoScraper(max_pages=2)
+    scraper = AvitoScraper(max_pages=10)
     df = scraper.scrape()
 
     print("\n" + "=" * 60)

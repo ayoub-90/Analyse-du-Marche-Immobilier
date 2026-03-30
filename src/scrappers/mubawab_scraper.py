@@ -17,6 +17,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import undetected_chromedriver as uc
 import logging
+import json
 
 # Créer dossier logs
 os.makedirs('logs', exist_ok=True)
@@ -34,13 +35,14 @@ logger = logging.getLogger(__name__)
 
 
 class MubawabScraper:
-    """Scraper Mubawab simplifié et robuste"""
+    """Scraper Mubawab simplifié et robuste avec gestion d'état (Micro-batch)"""
     
-    def __init__(self, max_pages: int = 10):
-        self.max_pages = max_pages
+    def __init__(self, target_count: int = 20):
+        self.target_count = target_count
         self.base_url = "https://www.mubawab.ma/fr/sc/appartements-a-vendre"
         self.data: List[Dict] = []
         self.driver = None
+        self.state_file = "data/state/mubawab_state.json"
         
         # Mapping types de biens (identique à Avito pour uniformité)
         self.type_mapping = {
@@ -54,21 +56,50 @@ class MubawabScraper:
             "local": "Local Commercial"
         }
     
-    def setup_driver(self):
-        """Initialise le driver Chrome"""
-        options = uc.ChromeOptions()
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1920,1080")
+    # def setup_driver(self):
+    #     """Initialise le driver Chrome"""
+    #     options = uc.ChromeOptions()
+    #     options.add_argument("--disable-blink-features=AutomationControlled")
+    #     options.add_argument("--no-sandbox")
+    #     options.add_argument("--disable-dev-shm-usage")
+    #     options.add_argument("--window-size=1920,1080")
         
-        try:
-            self.driver = uc.Chrome(options=options, use_subprocess=True, version_main=145)
-            logger.info("✅ Driver Chrome initialisé")
-        except Exception as e:
-            logger.error(f"❌ Erreur driver: {e}")
-            raise
-    
+    #     try:
+    #         self.driver = uc.Chrome(options=options, use_subprocess=True, version_main=145)
+    #         logger.info("✅ Driver Chrome initialisé")
+    #     except Exception as e:
+    #         logger.error(f"❌ Erreur driver: {e}")
+    #         raise
+    def setup_driver(self):
+        is_docker = os.path.exists('/.dockerenv') or os.environ.get('AIRFLOW_HOME')
+
+        if is_docker:
+            from selenium import webdriver as selenium_webdriver
+            from selenium.webdriver.chrome.service import Service
+
+            options = selenium_webdriver.ChromeOptions()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            options.binary_location = "/usr/bin/chromium"
+
+            service = Service("/usr/bin/chromedriver")
+            self.driver = selenium_webdriver.Chrome(service=service, options=options)
+            self.driver.set_page_load_timeout(30)
+            logger.info("✅ Driver Chromium (Docker) initialisé")
+        else:
+            options = uc.ChromeOptions()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            self.driver = uc.Chrome(options=options, use_subprocess=True)
+            self.driver.set_page_load_timeout(30)
+            logger.info("✅ Driver Chrome (Local) initialisé")
     def extract_type_bien(self, titre: str, type_from_page: str = "") -> str:
         """Extrait le type de bien"""
         text = (titre + " " + type_from_page).lower()
@@ -125,6 +156,7 @@ class MubawabScraper:
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/appartement-']"))
             )
+            self.driver.execute_script("window.stop();")
             time.sleep(random.uniform(2, 3))
         except Exception as e:
             logger.warning(f"⚠️ Timeout page {page_num}: {e}")
@@ -154,6 +186,7 @@ class MubawabScraper:
             time.sleep(random.uniform(2, 3))
         except Exception as e:
             logger.warning(f"⚠️ Timeout: {url}")
+            # self.driver.execute_script("window.stop();")
             return None
         
         data = {
@@ -249,30 +282,51 @@ class MubawabScraper:
             logger.error(f"❌ Erreur extraction: {e}")
             return None
     
+    def get_state(self) -> int:
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    return json.load(f).get('last_page', 1)
+            except Exception:
+                pass
+        return 1
+
+    def save_state(self, page: int):
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+        with open(self.state_file, 'w') as f:
+            json.dump({'last_page': page}, f)
+
     def scrape(self) -> pd.DataFrame:
         """Lance le scraping complet"""
-        logger.info("🚀 Démarrage scraping Mubawab")
-        logger.info(f"Pages max: {self.max_pages}")
+        logger.info("🚀 Démarrage scraping Mubawab (Micro-batching)")
+        logger.info(f"Cible: {self.target_count} annonces")
         
         self.setup_driver()
         
         try:
-            # Phase 1: Collecter URLs
-            all_urls = []
-            for page in range(1, self.max_pages + 1):
-                urls = self.scrape_listing_page(page)
-                all_urls.extend(urls)
-                time.sleep(random.uniform(2, 4))
+            current_page = self.get_state()
+            logger.info(f"🔄 Reprise depuis la page {current_page}")
             
-            logger.info(f"📊 Total URLs: {len(all_urls)}")
-            
-            # Phase 2: Scraper détails
-            for idx, url in enumerate(all_urls, 1):
-                logger.info(f"[{idx}/{len(all_urls)}] Extraction...")
-                data = self.scrape_detail_page(url)
-                if data:
-                    self.data.append(data)
-                time.sleep(random.uniform(3, 5))
+            while len(self.data) < self.target_count:
+                logger.info(f"📄 Scraping Page {current_page}...")
+                urls = self.scrape_listing_page(current_page)
+                
+                if not urls:
+                    logger.warning("Fin des pages atteintes ou blocage.")
+                    break
+                    
+                for idx, url in enumerate(urls, 1):
+                    if len(self.data) >= self.target_count:
+                        break
+                    logger.info(f"[{len(self.data)+1}/{self.target_count}] Extraction: {url}")
+                    data = self.scrape_detail_page(url)
+                    if data:
+                        self.data.append(data)
+                    time.sleep(random.uniform(2, 4))
+                
+                current_page += 1
+                self.save_state(current_page)
+                time.sleep(random.uniform(1, 3))
             
             # Sauvegarder
             df = pd.DataFrame(self.data)
@@ -280,10 +334,12 @@ class MubawabScraper:
             filepath = f"data/raw/mubawab/mubawab_{timestamp}.csv"
             
             os.makedirs("data/raw/mubawab", exist_ok=True)
-            df.to_csv(filepath, index=False, encoding='utf-8-sig')
+            if not df.empty:
+                df.to_csv(filepath, index=False, encoding='utf-8-sig')
             
             logger.info(f"💾 Sauvegardé: {filepath}")
             logger.info(f"📊 {len(df)} annonces extraites")
+            self.driver.execute_script("window.stop();")
             
             return df
             
@@ -295,19 +351,30 @@ class MubawabScraper:
 
 def main():
     """Point d'entrée"""
-    scraper = MubawabScraper(max_pages=2)  # Test batch: 2 pages
+    scraper = MubawabScraper(target_count=10)
     df = scraper.scrape()
+    
+    # Filtrer uniquement les annonces avec prix
+    df_avec_prix = df[df['prix'].notna()].copy()
     
     # Stats rapides
     print("\n" + "="*60)
     print("STATISTIQUES MUBAWAB")
     print("="*60)
-    print(f"Total annonces: {len(df)}")
-    print(f"\nTypes de biens:")
-    print(df['type_bien'].value_counts())
-    print(f"\nVilles:")
-    print(df['ville'].value_counts())
-    print(f"\nPrix moyen: {df['prix'].mean():,.0f} MAD")
+    print(f"Total annonces extraites : {len(df)}")
+    print(f"Annonces avec prix       : {len(df_avec_prix)}")
+    print(f"Annonces sans prix       : {len(df) - len(df_avec_prix)}")
+    
+    if not df_avec_prix.empty:
+        print(f"\nTypes de biens:\n{df_avec_prix['type_bien'].value_counts()}")
+        print(f"\nVilles:\n{df_avec_prix['ville'].value_counts()}")
+        print(f"\nPrix moyen  : {df_avec_prix['prix'].mean():,.0f} MAD")
+        print(f"Prix médian : {df_avec_prix['prix'].median():,.0f} MAD")
+        print(f"Prix min    : {df_avec_prix['prix'].min():,.0f} MAD")
+        print(f"Prix max    : {df_avec_prix['prix'].max():,.0f} MAD")
+    else:
+        print("\n⚠️ Aucun prix extrait")
+    
     print("="*60)
 
 
