@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ML Pipeline - Preprocessing Immobilier Maroc
-=============================================
-Pipeline complet en 7 étapes pour préparer les données aux modèles ML.
+ML Pipeline - Immobilier Maroc
+==============================
+Pipeline complet 7 étapes + entraînement RandomForest incrémental.
 
-Étapes:
-  1. Chargement & Validation du schéma
-  2. Feature Engineering
-  3. Suppression des Outliers (IQR)
-  4. Imputation des valeurs manquantes
-  5. Encodage des variables catégorielles
-  6. Normalisation / Scaling
-  7. Split Train / Test
-
-Output: data/final/ → X_train, X_test, y_train, y_test + scaler/encoders
+Fonctionnalités :
+  - RandomForestRegressor avec suivi par epoch (batch d'arbres)
+  - Accuracy (R²) + Loss (RMSE) enregistrés par epoch => PostgreSQL
+  - Métriques finales + prédictions => PostgreSQL
+  - Export modèle (.pkl + .joblib)
+  - Apprentissage incrémental sur les nouvelles lignes collectées
 """
 
 import os
-import re
 import glob
 import json
 import pickle
@@ -28,26 +23,27 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import joblib
+import psycopg2
+
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import psycopg2
 
 warnings.filterwarnings('ignore')
 
 # ─────────────────────────────────────────────
-# Paths — resolved from THIS file so they work
-# whether run directly or imported from a notebook
+# Paths
 # ─────────────────────────────────────────────
-_HERE        = os.path.dirname(os.path.abspath(__file__))   # src/cleaning/
-_PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, '..', '..'))  # project root
-_LOGS_DIR    = os.path.join(_PROJECT_ROOT, 'logs')
-_FINAL_DIR   = os.path.join(_PROJECT_ROOT, 'data', 'final')
+_HERE         = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, '..', '..'))
+_LOGS_DIR     = os.path.join(_PROJECT_ROOT, 'logs')
+_FINAL_DIR    = os.path.join(_PROJECT_ROOT, 'data', 'final')
+_MODEL_DIR    = os.path.join(_PROJECT_ROOT, 'data', 'models')
 
-# Create directories BEFORE logging setup (FileHandler needs the dir to exist)
-os.makedirs(_LOGS_DIR,  exist_ok=True)
-os.makedirs(_FINAL_DIR, exist_ok=True)
+for d in [_LOGS_DIR, _FINAL_DIR, _MODEL_DIR]:
+    os.makedirs(d, exist_ok=True)
 
 # ─────────────────────────────────────────────
 # Logging
@@ -62,21 +58,132 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TARGET       = 'prix'
-TEST_SIZE    = 0.20
-RANDOM_STATE = 42
-IQR_FACTOR   = 3.0          # outliers au-delà de 3×IQR
-PRIX_MIN     = 100_000       # MAD — filtre absolu en bas
-PRIX_MAX     = 20_000_000    # MAD — filtre absolu en haut
-
+TARGET           = 'prix'
+TEST_SIZE        = 0.20
+RANDOM_STATE     = 42
+IQR_FACTOR       = 3.0
+PRIX_MIN         = 100_000
+PRIX_MAX         = 20_000_000
 CATEGORICAL_COLS = ['type_bien', 'ville', 'source']
 BOOLEAN_COLS     = ['parking', 'ascenseur', 'balcon', 'piscine', 'jardin']
 DROP_COLS        = ['id_annonce', 'titre', 'description', 'url',
                     'date_scraping', 'nb_chambres', 'nb_salles_bain', 'etage']
+
+# RandomForest epoch config
+# 1 epoch = TREES_PER_EPOCH trees added via warm_start
+TOTAL_TREES      = 100   # total estimators at end of training
+TREES_PER_EPOCH  = 10    # trees added per epoch  →  10 epochs total
+
+# Model file paths
+MODEL_PKL  = os.path.join(_MODEL_DIR, 'rf_model.pkl')
+MODEL_JL   = os.path.join(_MODEL_DIR, 'rf_model.joblib')
+SEEN_FILE  = os.path.join(_MODEL_DIR, 'seen_indices.json')
+
+
+# ═══════════════════════════════════════════════════════
+# PostgreSQL helpers
+# ═══════════════════════════════════════════════════════
+
+def get_pg_conn():
+    return psycopg2.connect(
+        host    =os.getenv("PG_HOST",     "localhost"),
+        port    =int(os.getenv("PG_PORT", "5433")),
+        dbname  =os.getenv("PG_DB",       "immobilier_maroc"),
+        user    =os.getenv("PG_USER",     "immobilier"),
+        password=os.getenv("PG_PASSWORD", "immobilier123")
+    )
+
+
+def pg_ensure_tables(conn):
+    """Create all required tables if they don't exist."""
+    with conn.cursor() as cur:
+
+        # Final model metrics (one row per full run)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS model_metrics (
+                id                  SERIAL PRIMARY KEY,
+                run_at              TIMESTAMP DEFAULT NOW(),
+                modele              TEXT,
+                r2_score            FLOAT,
+                rmse                FLOAT,
+                mae                 FLOAT,
+                lignes_entrainement INTEGER,
+                mode_entrainement   TEXT
+            );
+        """)
+
+        # Per-epoch training curve: accuracy (R²) + loss (RMSE)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS model_epochs (
+                id         SERIAL PRIMARY KEY,
+                run_at     TIMESTAMP DEFAULT NOW(),
+                modele     TEXT,
+                run_mode   TEXT,
+                epoch      INTEGER,
+                n_trees    INTEGER,
+                accuracy   FLOAT,   -- R² on test set at this epoch
+                loss       FLOAT    -- RMSE on test set at this epoch
+            );
+        """)
+
+        # Sample predictions (up to 500 rows per run)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id           SERIAL PRIMARY KEY,
+                predicted_at TIMESTAMP DEFAULT NOW(),
+                surface_m2   FLOAT,
+                ville        TEXT,
+                type_bien    TEXT,
+                prix_reel    FLOAT,
+                prix_predit  FLOAT,
+                erreur_abs   FLOAT
+            );
+        """)
+    conn.commit()
+
+
+def pg_insert_metrics(conn, model_name, r2, rmse, mae, n_train, mode):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO model_metrics
+                (modele, r2_score, rmse, mae, lignes_entrainement, mode_entrainement)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (model_name, float(r2), float(rmse), float(mae), int(n_train), mode))
+    conn.commit()
+
+
+def pg_insert_epoch(conn, model_name, run_mode, epoch, n_trees, accuracy, loss):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO model_epochs
+                (modele, run_mode, epoch, n_trees, accuracy, loss)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (model_name, run_mode, epoch, n_trees, float(accuracy), float(loss)))
+    conn.commit()
+
+
+def pg_insert_predictions(conn, df_pred):
+    with conn.cursor() as cur:
+        rows = [
+            (
+                row.get('surface_m2'),
+                row.get('ville'),
+                row.get('type_bien'),
+                float(row['prix_reel']),
+                float(row['prix_predit']),
+                float(row['erreur_abs'])
+            )
+            for _, row in df_pred.iterrows()
+        ]
+        cur.executemany("""
+            INSERT INTO predictions
+                (surface_m2, ville, type_bien, prix_reel, prix_predit, erreur_abs)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, rows)
+    conn.commit()
 
 
 # ═══════════════════════════════════════════════════════
@@ -85,216 +192,171 @@ DROP_COLS        = ['id_annonce', 'titre', 'description', 'url',
 
 class MLPipeline:
     """
-    Pipeline séquentiel de preprocessing pour modèles ML immobilier.
+    Pipeline séquentiel preprocessing + RandomForest avec tracking par epoch.
 
     Usage:
         pipeline = MLPipeline()
-        pipeline.run()
+        pipeline.run()                    # entraînement complet
+        pipeline.run(incremental=True)    # apprentissage sur nouvelles lignes
     """
 
-    def __init__(self, data_dir: str = 'data/processed', output_dir: str = 'data/final'):
-        # Resolve to absolute paths so this works when imported from any working directory
+    def __init__(self, data_dir='data/processed', output_dir='data/final'):
         self.data_dir   = os.path.abspath(data_dir)
         self.output_dir = os.path.abspath(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
-        self.df         = None
-        self.report     = {
+
+        self.df          = None
+        self.scaler      = StandardScaler()
+        self.encoders    = {}
+        self.scaled_cols = []
+        self.report      = {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'steps': {}
         }
-        self.scaler   = StandardScaler()
-        self.encoders = {}    # col → LabelEncoder
-        self.scaled_cols = [] # colonnes normalisées
 
-    # ─── Utilitaires ──────────────────────────────────────────
-    def _log_step(self, step: str, before: int, after: int, details: dict = None):
+    # ─── Utilities ───────────────────────────────────────────────
+
+    def _log_step(self, step, before, after, details=None):
         dropped = before - after
         pct     = (dropped / before * 100) if before > 0 else 0
-        logger.info(f"  {'↳'} {before} → {after} lignes  ({dropped} supprimées, {pct:.1f}%)")
+        logger.info(f"  ↳ {before} → {after} lignes  ({dropped} supprimées, {pct:.1f}%)")
         self.report['steps'][step] = {
-            'rows_before': before,
-            'rows_after':  after,
-            'dropped':     dropped,
+            'rows_before': before, 'rows_after': after, 'dropped': dropped,
             **(details or {})
         }
 
-    def _extract_numeric(self, series: pd.Series) -> pd.Series:
-        """Extrait le premier nombre d'une chaîne (ex: '3 pièces' → 3)."""
+    def _extract_numeric(self, series):
         return series.astype(str).str.extract(r'(\d+)')[0].astype(float)
 
-    # ─── ÉTAPE 1 : Chargement & Schéma ────────────────────────
-    def step1_load_and_validate(self) -> None:
+    # ─── STEP 1 : Load & Validate ────────────────────────────────
+
+    def step1_load_and_validate(self):
         logger.info("═" * 55)
-        logger.info("ÉTAPE 1 │ Chargement & Validation du schéma")
+        logger.info("ÉTAPE 1 │ Chargement & Validation")
         logger.info("═" * 55)
 
         files = glob.glob(os.path.join(self.data_dir, 'immobilier_maroc_*.csv'))
         if not files:
-            raise FileNotFoundError(f"Aucun fichier combiné trouvé dans {self.data_dir}")
+            raise FileNotFoundError(f"Aucun fichier trouvé dans {self.data_dir}")
 
         latest = max(files, key=os.path.getctime)
-        logger.info(f"  Fichier chargé : {latest}")
+        logger.info(f"  Fichier : {latest}")
         self.df = pd.read_csv(latest)
+        before  = len(self.df)
 
-        before = len(self.df)
-        logger.info(f"  Colonnes : {list(self.df.columns)}")
-
-        # Forcer les booleans en int
         for col in BOOLEAN_COLS:
             if col in self.df.columns:
                 self.df[col] = pd.to_numeric(self.df[col], errors='coerce').fillna(0).astype(int)
 
-        # Forcer prix en float
         self.df['prix'] = pd.to_numeric(self.df['prix'], errors='coerce')
-
-        # Forcer surface en float
         if 'surface_m2' in self.df.columns:
             self.df['surface_m2'] = pd.to_numeric(self.df['surface_m2'], errors='coerce')
 
-        # Standardiser les chaînes catégorielles
         for col in CATEGORICAL_COLS:
             if col in self.df.columns:
                 self.df[col] = self.df[col].astype(str).str.strip().str.title()
 
-        # Supprimer lignes sans prix (target variable)
         self.df = self.df[self.df['prix'].notna()]
-
         self._log_step('step1_load', before, len(self.df), {'file': latest})
-        logger.info(f"  ✅ Schéma validé — {len(self.df)} lignes\n")
+        logger.info(f"  ✅ {len(self.df)} lignes chargées\n")
 
-    # ─── ÉTAPE 2 : Feature Engineering ───────────────────────
-    def step2_feature_engineering(self) -> None:
+    # ─── STEP 2 : Feature Engineering ────────────────────────────
+
+    def step2_feature_engineering(self):
         logger.info("═" * 55)
         logger.info("ÉTAPE 2 │ Feature Engineering")
         logger.info("═" * 55)
-
         before = len(self.df)
 
-        # prix_m2 (recalculé proprement)
         mask = self.df['surface_m2'].notna() & (self.df['surface_m2'] > 0)
         self.df['prix_m2'] = np.nan
         self.df.loc[mask, 'prix_m2'] = (
             self.df.loc[mask, 'prix'] / self.df.loc[mask, 'surface_m2']
         ).round(2)
 
-        # Score équipements (0-5)
         equip = [c for c in BOOLEAN_COLS if c in self.df.columns]
         self.df['score_equipements'] = self.df[equip].sum(axis=1)
 
-        # Binaires individuels (déjà 0/1 mais on assure)
-        for col in equip:
-            self.df[col] = self.df[col].astype(int)
+        for src, dst in [('nb_chambres',    'chambres_num'),
+                         ('etage',          'etage_num'),
+                         ('nb_salles_bain', 'salles_bain_num')]:
+            if src in self.df.columns:
+                self.df[dst] = self._extract_numeric(self.df[src])
 
-        # Features derived from nb_chambres / etage (parse text → int)
-        if 'nb_chambres' in self.df.columns:
-            self.df['chambres_num'] = self._extract_numeric(self.df['nb_chambres'])
-            logger.info(f"  nb_chambres → chambres_num : {self.df['chambres_num'].notna().sum()} valides")
-
-        if 'etage' in self.df.columns:
-            self.df['etage_num'] = self._extract_numeric(self.df['etage'])
-            logger.info(f"  etage → etage_num : {self.df['etage_num'].notna().sum()} valides")
-
-        if 'nb_salles_bain' in self.df.columns:
-            self.df['salles_bain_num'] = self._extract_numeric(self.df['nb_salles_bain'])
-            logger.info(f"  nb_salles_bain → salles_bain_num : {self.df['salles_bain_num'].notna().sum()} valides")
-
-        logger.info(f"  Nouvelles colonnes créées : prix_m2, score_equipements, chambres_num, etage_num, salles_bain_num")
-
-        # Supprimer colonnes non exploitables par les modèles
         cols_to_drop = [c for c in DROP_COLS if c in self.df.columns]
         self.df.drop(columns=cols_to_drop, inplace=True)
-        logger.info(f"  Colonnes supprimées : {cols_to_drop}")
 
         self._log_step('step2_features', before, len(self.df))
-        logger.info(f"  ✅ Features engineerées — colonnes restantes : {list(self.df.columns)}\n")
+        logger.info(f"  ✅ Colonnes : {list(self.df.columns)}\n")
 
-    # ─── ÉTAPE 3 : Suppression des Outliers ───────────────────
-    def step3_remove_outliers(self) -> None:
-        logger.info("═" * 55)
-        logger.info("ÉTAPE 3 │ Suppression des Outliers")
-        logger.info("═" * 55)
+    # ─── STEP 3 : Remove Outliers ─────────────────────────────────
 
-        before = len(self.df)
+    def step3_remove_outliers(self):
+        logger.info("═" * 55)
+        logger.info(f"ÉTAPE 3 │ Suppression des Outliers (IQR×{IQR_FACTOR})")
+        logger.info("═" * 55)
+        before  = len(self.df)
         details = {}
 
         for col in ['prix', 'surface_m2', 'prix_m2']:
             if col not in self.df.columns:
                 continue
-            series = self.df[col].dropna()
-            Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
+            Q1, Q3 = self.df[col].quantile([0.25, 0.75])
             IQR    = Q3 - Q1
-            lo     = Q1 - IQR_FACTOR * IQR
-            hi     = Q3 + IQR_FACTOR * IQR
-            before_col = len(self.df)
-            mask = (self.df[col].isna()) | ((self.df[col] >= lo) & (self.df[col] <= hi))
-            self.df = self.df[mask]
-            removed = before_col - len(self.df)
-            logger.info(f"  {col:<12} │ [{lo:,.0f}, {hi:,.0f}] │ {removed} outliers supprimés")
-            details[col] = {'lo': round(lo, 2), 'hi': round(hi, 2), 'removed': removed}
+            lo, hi = Q1 - IQR_FACTOR * IQR, Q3 + IQR_FACTOR * IQR
+            prev   = len(self.df)
+            self.df = self.df[self.df[col].isna() | self.df[col].between(lo, hi)]
+            details[col] = {'removed': prev - len(self.df)}
+            logger.info(f"  {col:<12} [{lo:,.0f}, {hi:,.0f}] → {prev - len(self.df)} supprimés")
 
-        # Filtre absolu prix
-        before_abs = len(self.df)
+        prev = len(self.df)
         self.df = self.df[
-            self.df['prix'].isna() |
-            ((self.df['prix'] >= PRIX_MIN) & (self.df['prix'] <= PRIX_MAX))
+            self.df['prix'].isna() | self.df['prix'].between(PRIX_MIN, PRIX_MAX)
         ]
-        logger.info(f"  prix absolu [{PRIX_MIN:,}, {PRIX_MAX:,}] │ {before_abs - len(self.df)} supprimés")
+        logger.info(f"  prix absolu [{PRIX_MIN:,}, {PRIX_MAX:,}] → {prev - len(self.df)} supprimés")
 
         self._log_step('step3_outliers', before, len(self.df), details)
-        logger.info(f"  ✅ Outliers supprimés — {len(self.df)} lignes restantes\n")
+        logger.info(f"  ✅ {len(self.df)} lignes restantes\n")
 
-    # ─── ÉTAPE 4 : Imputation ─────────────────────────────────
-    def step4_impute(self) -> None:
-        logger.info("═" * 55)
-        logger.info("ÉTAPE 4 │ Imputation des valeurs manquantes")
-        logger.info("═" * 55)
+    # ─── STEP 4 : Imputation ──────────────────────────────────────
 
+    def step4_impute(self):
+        logger.info("═" * 55)
+        logger.info("ÉTAPE 4 │ Imputation")
+        logger.info("═" * 55)
         before = len(self.df)
-        imputed = {}
 
-        # Numériques → médiane
-        num_cols = ['surface_m2', 'prix_m2', 'chambres_num', 'etage_num', 'salles_bain_num']
-        for col in num_cols:
+        for col in ['surface_m2', 'prix_m2', 'chambres_num', 'etage_num', 'salles_bain_num']:
             if col not in self.df.columns:
                 continue
             missing = self.df[col].isna().sum()
-            if missing > 0:
-                median_val = self.df[col].median()
-                self.df[col] = self.df[col].fillna(median_val)
-                imputed[col] = {'strategy': 'median', 'value': round(median_val, 2), 'filled': int(missing)}
-                logger.info(f"  {col:<20} │ médiane={median_val:.2f} │ {missing} imputés")
+            if missing:
+                val = self.df[col].median()
+                self.df[col].fillna(val, inplace=True)
+                logger.info(f"  {col:<20} médiane={val:.2f}  ({missing} imputés)")
 
-        # Catégorielles → mode
         for col in CATEGORICAL_COLS:
             if col not in self.df.columns:
                 continue
-            missing = self.df[col].isna().sum() + (self.df[col] == 'Nan').sum()
-            if missing > 0:
-                mode_val = self.df[col][self.df[col] != 'Nan'].mode().iloc[0]
-                self.df[col] = self.df[col].replace('Nan', mode_val).fillna(mode_val)
-                imputed[col] = {'strategy': 'mode', 'value': mode_val, 'filled': int(missing)}
-                logger.info(f"  {col:<20} │ mode='{mode_val}' │ {missing} imputés")
+            self.df[col] = self.df[col].replace('Nan', np.nan)
+            missing = self.df[col].isna().sum()
+            if missing:
+                val = self.df[col].mode().iloc[0]
+                self.df[col].fillna(val, inplace=True)
+                logger.info(f"  {col:<20} mode='{val}'  ({missing} imputés)")
 
-        # Score équipements → 0 si manquant
         if 'score_equipements' in self.df.columns:
-            self.df['score_equipements'] = self.df['score_equipements'].fillna(0).astype(int)
+            self.df['score_equipements'].fillna(0, inplace=True)
 
-        self._log_step('step4_imputation', before, len(self.df), imputed)
+        self._log_step('step4_imputation', before, len(self.df))
+        logger.info("  ✅ Imputation terminée\n")
 
-        # Vérification finale
-        remaining = self.df.select_dtypes(include=[np.number]).isnull().sum()
-        remaining = remaining[remaining > 0]
-        if len(remaining) > 0:
-            logger.warning(f"  ⚠️ NaN restants après imputation : {remaining.to_dict()}")
-        else:
-            logger.info("  ✅ Aucune valeur manquante dans les colonnes numériques\n")
+    # ─── STEP 5 : Encoding ────────────────────────────────────────
 
-    # ─── ÉTAPE 5 : Encodage ───────────────────────────────────
-    def step5_encode(self) -> None:
+    def step5_encode(self):
         logger.info("═" * 55)
-        logger.info("ÉTAPE 5 │ Encodage des variables catégorielles")
+        logger.info("ÉTAPE 5 │ Encodage catégoriel")
         logger.info("═" * 55)
-
         before = len(self.df)
 
         for col in CATEGORICAL_COLS:
@@ -302,195 +364,244 @@ class MLPipeline:
                 continue
             le = LabelEncoder()
             self.df[f'{col}_enc'] = le.fit_transform(self.df[col].astype(str))
-            self.encoders[col] = le
-            classes = list(le.classes_)
-            logger.info(f"  {col:<12} → {col}_enc │ {len(classes)} classes : {classes[:8]}{'...' if len(classes)>8 else ''}")
+            self.encoders[col]    = le
+            logger.info(f"  {col} → {col}_enc ({len(le.classes_)} classes)")
 
-        # Supprimer les colonnes originales (remplacées par _enc)
-        cols_to_drop = [c for c in CATEGORICAL_COLS if c in self.df.columns]
-        self.df.drop(columns=cols_to_drop, inplace=True)
-
+        self.df.drop(columns=[c for c in CATEGORICAL_COLS if c in self.df.columns], inplace=True)
         self._log_step('step5_encoding', before, len(self.df))
-        logger.info(f"  ✅ Encodage terminé — colonnes numériques : {list(self.df.columns)}\n")
+        logger.info("  ✅ Encodage terminé\n")
 
-    # ─── ÉTAPE 6 : Scaling ────────────────────────────────────
-    def step6_scale(self) -> None:
+    # ─── STEP 6 : Scaling ─────────────────────────────────────────
+
+    def step6_scale(self):
         logger.info("═" * 55)
-        logger.info("ÉTAPE 6 │ Normalisation (StandardScaler)")
+        logger.info("ÉTAPE 6 │ StandardScaler")
         logger.info("═" * 55)
-
-        before = len(self.df)
-
-        # Colonnes candidates au scaling (exclure target et booléens)
+        before  = len(self.df)
         exclude = [TARGET, 'score_equipements'] + BOOLEAN_COLS + \
                   [f'{c}_enc' for c in CATEGORICAL_COLS]
 
         self.scaled_cols = [
             c for c in self.df.select_dtypes(include=[np.number]).columns
-            if c not in exclude and c in self.df.columns
+            if c not in exclude
         ]
-
-        logger.info(f"  Colonnes normalisées : {self.scaled_cols}")
-
         self.df[self.scaled_cols] = self.scaler.fit_transform(self.df[self.scaled_cols])
 
-        self._log_step('step6_scaling', before, len(self.df),
-                       {'scaled_cols': self.scaled_cols})
+        self._log_step('step6_scaling', before, len(self.df), {'scaled_cols': self.scaled_cols})
         logger.info("  ✅ Scaling terminé\n")
 
-    # ─── ÉTAPE 7 : Train / Test Split ─────────────────────────
-    def step7_split_and_save(self) -> None:
+    # ─── STEP 7 : Train/Test Split & Save ─────────────────────────
+
+    def step7_split_and_save(self):
         logger.info("═" * 55)
-        logger.info("ÉTAPE 7 │ Split Train/Test & Sauvegarde")
+        logger.info("ÉTAPE 7 │ Split & Sauvegarde")
         logger.info("═" * 55)
 
-        # Supprimer les NaN restants (sécurité finale)
-        before = len(self.df)
-        self.df = self.df.dropna()
-        logger.info(f"  Nettoyage final : {before} → {len(self.df)} lignes")
-
+        self.df.dropna(inplace=True)
         if len(self.df) < 10:
-            raise ValueError(f"Dataset trop petit après pipeline : {len(self.df)} lignes")
+            raise ValueError(f"Dataset trop petit : {len(self.df)} lignes")
 
-        # Séparer features et target
         X = self.df.drop(columns=[TARGET])
         y = self.df[[TARGET]]
 
-        logger.info(f"  Features (X) : {X.shape[1]} colonnes")
-        logger.info(f"  Target  (y)  : {TARGET}")
-
-        # Split
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y,
-            test_size    = TEST_SIZE,
-            random_state = RANDOM_STATE
+            X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
         )
+        logger.info(f"  Train : {len(X_train)}  Test : {len(X_test)}")
 
-        logger.info(f"  Train : {len(X_train)} lignes ({(1-TEST_SIZE)*100:.0f}%)")
-        logger.info(f"  Test  : {len(X_test)}  lignes ({TEST_SIZE*100:.0f}%)")
+        for name, obj in [('X_train', X_train), ('X_test', X_test),
+                          ('y_train', y_train), ('y_test',  y_test)]:
+            obj.to_csv(f'{self.output_dir}/{name}.csv', index=False)
 
-        # Sauvegarder les CSV
-        X_train.to_csv(f'{self.output_dir}/X_train.csv', index=False)
-        X_test.to_csv( f'{self.output_dir}/X_test.csv',  index=False)
-        y_train.to_csv(f'{self.output_dir}/y_train.csv', index=False)
-        y_test.to_csv( f'{self.output_dir}/y_test.csv',  index=False)
-        logger.info(f"  💾 CSV sauvegardés dans {self.output_dir}/")
+        joblib.dump(self.scaler,   f'{self.output_dir}/scaler.joblib')
+        joblib.dump(self.encoders, f'{self.output_dir}/encoders.joblib')
 
-        # Sauvegarder les artefacts sklearn
-        with open(f'{self.output_dir}/scaler.pkl', 'wb') as f:
-            pickle.dump(self.scaler, f)
-        with open(f'{self.output_dir}/encoders.pkl', 'wb') as f:
-            pickle.dump(self.encoders, f)
-        logger.info("  💾 scaler.pkl, encoders.pkl sauvegardés")
-
-        # Rapport final
         self.report['steps']['step7_split'] = {
-            'total_rows':    len(self.df),
-            'n_features':    X.shape[1],
-            'features':      list(X.columns),
-            'target':        TARGET,
-            'train_rows':    len(X_train),
-            'test_rows':     len(X_test),
-            'test_size':     TEST_SIZE,
-            'random_state':  RANDOM_STATE
+            'total_rows': len(self.df), 'n_features': X.shape[1],
+            'features': list(X.columns), 'train_rows': len(X_train),
+            'test_rows': len(X_test)
         }
-        self.report['status'] = 'SUCCESS'
-        self.report['output_dir'] = self.output_dir
+        logger.info("  ✅ Split & sauvegarde terminés\n")
 
-        report_path = f'{self.output_dir}/pipeline_report.json'
-        with open(report_path, 'w', encoding='utf-8') as f:
-            json.dump(self.report, f, indent=2, ensure_ascii=False)
-        logger.info(f"  📄 Rapport : {report_path}\n")
+    # ─── STEP 8 : Train epoch-by-epoch, Evaluate, PostgreSQL, Export ──
 
-        # Résumé console
-        logger.info("═" * 55)
-        logger.info("✅ PIPELINE TERMINÉ")
-        logger.info("═" * 55)
-        logger.info(f"  Dataset final  : {len(self.df)} lignes × {X.shape[1]+1} colonnes")
-        logger.info(f"  X_train shape  : {X_train.shape}")
-        logger.info(f"  X_test  shape  : {X_test.shape}")
-        logger.info(f"  y_train shape  : {y_train.shape}")
-        logger.info(f"  y_test  shape  : {y_test.shape}")
-        logger.info(f"  Colonnes X     : {list(X.columns)}")
-        logger.info("═" * 55)
+    def step8_train_and_evaluate(self, incremental=False):
+        """
+        Entraîne RandomForest epoch par epoch via warm_start.
 
-    # ─── ÉTAPE 8 : Entraînement & Logs KPI Power BI ───────────
-    def step8_train_and_evaluate(self) -> None:
+        Chaque epoch ajoute TREES_PER_EPOCH arbres et mesure sur X_test :
+          - accuracy = R²   (plus c'est haut, mieux c'est)
+          - loss     = RMSE (plus c'est bas, mieux c'est)
+
+        Les deux métriques sont loggées console ET insérées dans
+        la table model_epochs de PostgreSQL à chaque epoch.
+
+        incremental=True  → charge le modèle existant et continue
+                            l'entraînement sur les nouvelles lignes.
+        incremental=False → repart de zéro.
+        """
         logger.info("═" * 55)
-        logger.info("ÉTAPE 8 │ Entraînement Modèle & KPI Power BI")
+        mode_label = "INCRÉMENTAL" if incremental else "COMPLET"
+        logger.info(f"ÉTAPE 8 │ RandomForest {mode_label} — epoch tracking")
         logger.info("═" * 55)
 
-        X_train_path = os.path.join(self.output_dir, 'X_train.csv')
-        y_train_path = os.path.join(self.output_dir, 'y_train.csv')
-        X_test_path  = os.path.join(self.output_dir, 'X_test.csv')
-        y_test_path  = os.path.join(self.output_dir, 'y_test.csv')
+        X_train = pd.read_csv(f'{self.output_dir}/X_train.csv')
+        y_train = pd.read_csv(f'{self.output_dir}/y_train.csv')[TARGET]
+        X_test  = pd.read_csv(f'{self.output_dir}/X_test.csv')
+        y_test  = pd.read_csv(f'{self.output_dir}/y_test.csv')[TARGET]
 
-        if not all(os.path.exists(p) for p in [X_train_path, y_train_path, X_test_path, y_test_path]):
-            logger.warning("Fichiers train/test introuvables. Étape 8 ignorée.")
-            return
-
-        X_train = pd.read_csv(X_train_path)
-        y_train = pd.read_csv(y_train_path)['prix']
-        X_test  = pd.read_csv(X_test_path)
-        y_test  = pd.read_csv(y_test_path)['prix']
-
-        logger.info("  🤖 Entraînement du modèle (RandomForestRegressor)...")
-        # On utilise un modèle rapide mais robuste pour le pipeline continu
-        model = RandomForestRegressor(n_estimators=50, random_state=RANDOM_STATE, n_jobs=-1)
-        model.fit(X_train, y_train)
-
-        # Predictions
-        y_pred = model.predict(X_test)
-
-        # Calcul des métriques KPI
-        r2 = r2_score(y_test, y_pred)
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-
-        logger.info(f"  📊 Performance R² Score : {r2 * 100:.2f} %")
-        logger.info(f"  📊 Performance MAE      : {mae:,.0f} MAD")
-        logger.info(f"  📊 Performance RMSE     : {rmse:,.0f} MAD")
-
-        # Sauvegarder le modèle
-        model_dir = os.path.join(_PROJECT_ROOT, 'data', 'models')
-        os.makedirs(model_dir, exist_ok=True)
-        model_path = os.path.join(model_dir, 'rf_model.pkl')
-        with open(model_path, 'wb') as f:
-            pickle.dump(model, f)
-        logger.info(f"  💾 Modèle sauvegardé dans {model_path}")
-
-        # Enregistrement dans PostgreSQL pour Power BI
-        logger.info("  🐘 Insertion des KPIs dans PostgreSQL (model_metrics)...")
-        try:
-            conn = psycopg2.connect(
-                host=os.getenv("PG_HOST", "localhost"),
-                port=int(os.getenv("PG_PORT", "5433")),
-                dbname=os.getenv("PG_DB", "immobilier_maroc"),
-                user=os.getenv("PG_USER", "immobilier"),
-                password=os.getenv("PG_PASSWORD", "immobilier123")
+        # ── Choose training data & model ──────────────────────────
+        if incremental and os.path.exists(MODEL_JL):
+            model = joblib.load(MODEL_JL)
+            logger.info("  🔄 Modèle existant chargé (apprentissage incrémental)")
+            seen    = self._load_seen_indices()
+            new_idx = [i for i in X_train.index if i not in seen]
+            if not new_idx:
+                logger.info("  ℹ️ Aucune nouvelle ligne — entraînement ignoré")
+                return
+            X_fit       = X_train.loc[new_idx]
+            y_fit       = y_train.loc[new_idx]
+            start_trees = model.n_estimators   # pick up from existing count
+            logger.info(f"  Nouvelles lignes : {len(X_fit)}")
+        else:
+            model = RandomForestRegressor(
+                n_estimators = TREES_PER_EPOCH,  # grows each epoch
+                warm_start   = True,              # reuse already built trees
+                random_state = RANDOM_STATE,
+                n_jobs       = -1
             )
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO model_metrics (modele, r2_score, rmse, mae, lignes_entrainement)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, ("RandomForestRegressor", float(r2), float(rmse), float(mae), len(X_train)))
-            conn.commit()
-            conn.close()
-            logger.info("  ✅ KPIs de performance du modèle enregistrés avec succès !")
-        except Exception as e:
-            logger.error(f"  ❌ Erreur lors de l'insertion dans PostgreSQL: {e}")
+            X_fit       = X_train
+            y_fit       = y_train
+            start_trees = 0
 
+        self._save_seen_indices(list(X_train.index))
+
+        # ── Open PostgreSQL connection once for entire training ───
+        try:
+            conn = get_pg_conn()
+            pg_ensure_tables(conn)
+            pg_connected = True
+        except Exception as e:
+            logger.warning(f"  ⚠️ PostgreSQL non disponible : {e}")
+            pg_connected = False
+            conn = None
+
+        # ── Epoch loop ────────────────────────────────────────────
+        n_epochs  = TOTAL_TREES // TREES_PER_EPOCH
+        epoch_log = []
+
+        logger.info(f"  🌲 {n_epochs} epochs × {TREES_PER_EPOCH} arbres = {TOTAL_TREES} arbres total")
+        logger.info(f"  {'Epoch':<8} {'N arbres':<12} {'Accuracy (R²)':<20} {'Loss (RMSE)'}")
+        logger.info(f"  {'─'*8} {'─'*12} {'─'*20} {'─'*15}")
+
+        for epoch in range(1, n_epochs + 1):
+            model.n_estimators = start_trees + epoch * TREES_PER_EPOCH
+            model.fit(X_fit, y_fit)
+
+            y_pred_ep = model.predict(X_test)
+            accuracy  = r2_score(y_test, y_pred_ep)
+            loss      = np.sqrt(mean_squared_error(y_test, y_pred_ep))
+
+            logger.info(
+                f"  Epoch {epoch:<4} {model.n_estimators:<12} "
+                f"{accuracy * 100:>12.2f} %      {loss:>12,.0f} MAD"
+            )
+
+            epoch_log.append({
+                'epoch': epoch, 'n_trees': model.n_estimators,
+                'accuracy': round(accuracy, 4), 'loss': round(loss, 2)
+            })
+
+            if pg_connected:
+                try:
+                    pg_insert_epoch(
+                        conn, "RandomForestRegressor", mode_label,
+                        epoch, model.n_estimators, accuracy, loss
+                    )
+                except Exception as e:
+                    logger.warning(f"  ⚠️ Epoch {epoch} insert error : {e}")
+
+        logger.info("  " + "─" * 55)
+
+        # ── Final metrics ─────────────────────────────────────────
+        y_pred_final = model.predict(X_test)
+        r2   = r2_score(y_test, y_pred_final)
+        mae  = mean_absolute_error(y_test, y_pred_final)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred_final))
+
+        logger.info(f"  📊 R² final  : {r2 * 100:.2f} %")
+        logger.info(f"  📊 MAE final : {mae:,.0f} MAD")
+        logger.info(f"  📊 RMSE final: {rmse:,.0f} MAD")
+
+        # ── Export model ──────────────────────────────────────────
+        with open(MODEL_PKL, 'wb') as f:
+            pickle.dump(model, f)
+        joblib.dump(model, MODEL_JL)
+        logger.info(f"  💾 {MODEL_PKL}")
+        logger.info(f"  💾 {MODEL_JL}")
+
+        # ── PostgreSQL : final metrics + predictions ──────────────
+        if pg_connected:
+            try:
+                pg_insert_metrics(
+                    conn, "RandomForestRegressor",
+                    r2, rmse, mae, len(X_fit), mode_label
+                )
+                logger.info("  ✅ Métriques finales → model_metrics")
+
+                # Build prediction sample with decoded labels
+                df_pred = X_test.copy().reset_index(drop=True)
+                df_pred['prix_reel']   = y_test.values
+                df_pred['prix_predit'] = y_pred_final
+                df_pred['erreur_abs']  = np.abs(df_pred['prix_reel'] - df_pred['prix_predit'])
+
+                for col in ['ville', 'type_bien']:
+                    enc_col = f'{col}_enc'
+                    if col in self.encoders and enc_col in df_pred.columns:
+                        df_pred[col] = self.encoders[col].inverse_transform(
+                            df_pred[enc_col].astype(int)
+                        )
+
+                sample = df_pred.sample(min(500, len(df_pred)), random_state=RANDOM_STATE)
+                pg_insert_predictions(conn, sample)
+                logger.info(f"  ✅ {len(sample)} prédictions → predictions")
+
+                conn.close()
+            except Exception as e:
+                logger.error(f"  ❌ PostgreSQL final insert error : {e}")
+
+        # ── Report ────────────────────────────────────────────────
         self.report['steps']['step8_model'] = {
-            'r2_score': round(r2, 4),
-            'mae': round(mae, 2),
-            'rmse': round(rmse, 2),
-            'model_used': 'RandomForestRegressor'
+            'r2_score':  round(r2,   4),
+            'mae':       round(mae,  2),
+            'rmse':      round(rmse, 2),
+            'mode':      mode_label,
+            'n_epochs':  n_epochs,
+            'epoch_log': epoch_log
         }
         logger.info("═" * 55)
 
-    # ─── RUN ──────────────────────────────────────────────────
-    def run(self) -> None:
-        """Exécute le pipeline séquentiel complet."""
+    # ─── Seen-indices helpers (incremental learning) ─────────────
+
+    def _load_seen_indices(self):
+        if os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE) as f:
+                return set(json.load(f))
+        return set()
+
+    def _save_seen_indices(self, indices):
+        with open(SEEN_FILE, 'w') as f:
+            json.dump(list(indices), f)
+
+    # ─── RUN ──────────────────────────────────────────────────────
+
+    def run(self, incremental=False):
+        """
+        Exécute le pipeline complet.
+
+        incremental=True  → réutilise le modèle existant et apprend
+                            uniquement sur les nouvelles lignes collectées.
+        """
         start = datetime.now()
         logger.info("\n" + "═" * 55)
         logger.info("🚀  DÉMARRAGE DU PIPELINE ML")
@@ -505,15 +616,23 @@ class MLPipeline:
             self.step5_encode()
             self.step6_scale()
             self.step7_split_and_save()
-            self.step8_train_and_evaluate()
+            self.step8_train_and_evaluate(incremental=incremental)
         except Exception as e:
-            logger.error(f"❌ PIPELINE ÉCHOUÉ à l'étape : {e}")
+            logger.error(f"❌ PIPELINE ÉCHOUÉ : {e}")
             self.report['status'] = 'FAILED'
-            self.report['error'] = str(e)
+            self.report['error']  = str(e)
             raise
 
         elapsed = (datetime.now() - start).seconds
+        self.report['status']   = 'SUCCESS'
+        self.report['duration'] = elapsed
         logger.info(f"\n  ⏱️  Temps total : {elapsed}s")
+
+        report_path = f'{self.output_dir}/pipeline_report.json'
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(self.report, f, indent=2, ensure_ascii=False)
+        logger.info(f"  📄 Rapport : {report_path}")
+
         return self.report
 
 
@@ -522,8 +641,15 @@ class MLPipeline:
 # ═══════════════════════════════════════════════════════
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='ML Pipeline Immobilier Maroc')
+    parser.add_argument('--incremental', action='store_true',
+                        help='Continue learning from new data only')
+    args = parser.parse_args()
+
     pipeline = MLPipeline(
         data_dir   = 'data/processed',
         output_dir = 'data/final'
     )
-    pipeline.run()
+    pipeline.run(incremental=args.incremental)

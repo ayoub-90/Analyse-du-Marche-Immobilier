@@ -94,3 +94,13 @@ CREATE TABLE IF NOT EXISTS model_metrics (
     mae NUMERIC,
     lignes_entrainement INTEGER
 );
+CREATE TABLE IF NOT EXISTS model_epochs (
+    id         SERIAL PRIMARY KEY,
+    run_at     TIMESTAMP DEFAULT NOW(),
+    modele     TEXT,
+    run_mode   TEXT,
+    epoch      INTEGER,
+    n_trees    INTEGER,
+    accuracy   FLOAT,   -- R² sur le test à cet epoch
+    loss       FLOAT    -- RMSE sur le test à cet epoch
+);
